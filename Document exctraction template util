@@ -1,0 +1,941 @@
+@Slf4j
+@ApplicationScoped
+public class DocumentExtractionTemplateUtil {
+
+    @Inject
+    DynamoSubmissionStore submissionStore;
+    @Inject
+    S3Service s3Service;
+    @Inject
+    JsonUpdater jsonUpdater;
+    @Inject
+    DynamoManagementStore managementStore;
+    private CellStyle headerStyle;
+
+    public boolean documentExtractionToTemplate(String orgId, String userId, String submissionId, UpdateEntity updateEntity) {
+        log.info("Document Extraction To Template: {} and updateEntity: {}", submissionId, updateEntity);
+
+        Workbook workbook = new XSSFWorkbook();
+        Sheet sheet = workbook.createSheet("Document Extraction");
+        int columnWidth = 22; // Example: Set the width to 15 characters
+        sheet.setColumnWidth(0, columnWidth * 256);
+        sheet.setColumnWidth(1, columnWidth * 512);
+        sheet.setColumnWidth(2, columnWidth * 512);
+        sheet.setColumnWidth(3, columnWidth * 512);
+        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+        InputStream imageStream = classLoader.getResourceAsStream("static/logo.png");
+        SubmissionResult submissionResult = submissionStore.getResult(orgId, userId, submissionId, updateEntity.getIdentifier()).await().indefinitely();
+        String rawResult = s3Service.getFile(submissionResult.getResultPath());
+
+        try {
+            if (updateEntity.getEntityUpdates() != null) {
+                DocumentProcessorConfig documentProcessorConfig = managementStore.getDocumentProcessorConfig(orgId, updateEntity.getDocumentType())
+                        .onItem().transform(document -> document.toBuilder().build())
+                        .collect().first().await().indefinitely();
+
+                if (documentProcessorConfig != null) {
+                    List<DocumentProcessorConfigField> configFields = documentProcessorConfig.getConfigFields();
+
+                    String updateResult = rawResult;
+                    for (Map.Entry<String, String> entry : updateEntity.getEntityUpdates().entrySet()) {
+                        updateResult = jsonUpdater.updateReviewRequiredField(updateResult, entry.getKey(), entry.getValue(), configFields);
+                    }
+                    s3Service.uploadJson(updateResult, submissionResult.getResultPath());
+                }
+            }
+        } catch (Exception ex) {
+            log.error("[documentExtractionToTemplate] upload updated json: {}", ex);
+        }
+
+        List<DocumentType> documentTypeList = Arrays.asList(DocumentType.DTI_CERTIFICATE, DocumentType.REGISTRATION_CERTIFICATE, DocumentType.PAYSLIP);
+        try {
+            ObjectMapper mapper = getObjectMapper();
+
+            // Add the image to the workbook
+            byte[] imageBytes = IOUtils.toByteArray(imageStream);
+            int pictureIdx = workbook.addPicture(imageBytes, Workbook.PICTURE_TYPE_PNG);
+            CreationHelper helper = workbook.getCreationHelper();
+            Drawing<?> drawing = sheet.createDrawingPatriarch();
+            ClientAnchor anchor = helper.createClientAnchor();
+            anchor.setCol2(1);
+            anchor.setRow2(1);
+            Picture picture = drawing.createPicture(anchor, pictureIdx);
+            picture.resize(1.2, 2.0);
+
+            Row headerRow = sheet.createRow(2);
+            Cell headerCell = headerRow.createCell(0);
+            CellStyle style = getHeaderStyle(workbook);
+            headerCell.setCellStyle(style);
+
+            if (updateEntity.getDocumentType().equals(DocumentType.FINANCIAL_STATEMENT)) {
+                JsonNode response = mapper.readTree(rawResult);
+                headerCell.setCellValue("Financial Statement Extracted Data");
+
+                // Sheet name
+
+                workbook.setSheetName(0, "Financial Position");
+                Sheet sheet1 = workbook.createSheet("Income Statement");
+                Sheet sheet2 = workbook.createSheet("Cash Flows");
+
+                int columnWidth1 = 22; // Example: Set the width to 15 characters
+                sheet.setColumnWidth(0, columnWidth * 384);
+                sheet.setColumnWidth(1, columnWidth * 256);
+                sheet.setColumnWidth(2, columnWidth * 192);
+                sheet.setColumnWidth(3, columnWidth * 192);
+                sheet1.setColumnWidth(0, columnWidth1 * 384);
+                sheet1.setColumnWidth(1, columnWidth1 * 192);
+                sheet1.setColumnWidth(2, columnWidth1 * 192);
+                sheet1.setColumnWidth(3, columnWidth1 * 192);
+                sheet2.setColumnWidth(0, columnWidth1 * 512);
+                sheet2.setColumnWidth(1, columnWidth1 * 192);
+                sheet2.setColumnWidth(2, columnWidth1 * 192);
+                sheet2.setColumnWidth(3, columnWidth1 * 192);
+                sheet2.setColumnWidth(4, columnWidth1 * 192);
+
+                // Sheet Income Statement Picture and Header
+
+                CreationHelper helper1 = workbook.getCreationHelper();
+                Drawing<?> drawing1 = sheet1.createDrawingPatriarch();
+                ClientAnchor anchor1 = helper1.createClientAnchor();
+                anchor1.setCol2(1);
+                anchor1.setRow2(1);
+                Picture picture1 = drawing1.createPicture(anchor1, pictureIdx);
+                picture1.resize(1.2, 2.0);
+                Row headerRow1 = sheet1.createRow(2);
+                Cell headerCell1 = headerRow1.createCell(0);
+                CellStyle style1 = getHeaderStyle(workbook);
+                headerCell1.setCellStyle(style1);
+                headerCell1.setCellValue("Financial Statement Extracted Data");
+
+                // Sheet Cash Flows Picture and Header
+
+                CreationHelper helper2 = workbook.getCreationHelper();
+                Drawing<?> drawing2 = sheet2.createDrawingPatriarch();
+                ClientAnchor anchor2 = helper2.createClientAnchor();
+                anchor2.setCol2(1);
+                anchor2.setRow2(1);
+                Picture picture2 = drawing2.createPicture(anchor2, pictureIdx);
+                picture2.resize(1.2, 2.0);
+                Row headerRow2 = sheet2.createRow(2);
+                Cell headerCell2 = headerRow2.createCell(0);
+                CellStyle style2 = getHeaderStyle(workbook);
+                headerCell2.setCellStyle(style2);
+                headerCell2.setCellValue("Financial Statement Extracted Data");
+
+                JsonNode financialPosition = response.get("data").get("result").get("financial_position");
+                JsonNode incomeStatement = response.get("data").get("result").get("income_statement");
+                JsonNode cashFlows = response.get("data").get("result").get("cash_flows");
+
+                rowIndex = 4;
+                columnIndex = -1;
+
+                extract (workbook, sheet, financialPosition);
+
+                rowIndex = 4;
+                columnIndex = -1;
+
+                extract (workbook, sheet1, incomeStatement);
+
+                rowIndex = 4;
+                columnIndex = -1;
+
+                extract (workbook, sheet2, cashFlows);
+            }
+
+            if (updateEntity.getDocumentType().equals(DocumentType.BANK_STATEMENT)) {
+                JsonNode response = mapper.readTree(rawResult);
+                headerCell.setCellValue("Bank Statement Extracted Data");
+
+                Row subInfoRow = sheet.createRow(4);
+                Cell subInfoCell = subInfoRow.createCell(3);
+                CellStyle subInfoStyle = getSubHeaderStyle(workbook);
+                subInfoCell.setCellStyle(subInfoStyle);
+
+                String startDate = "";
+                String endDate = "";
+                String startBalance = "";
+                String endBalance = "";
+                String totalTransaction = "";
+                for (JsonNode entity : response.get("data").get("customerInfo")) {
+                    if (entity.get("field").asText().equals("startDate")) {
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.get("id").asText())) {
+                            startDate = updateEntity.getEntityUpdates().get(entity.get("id").asText());
+                        } else {
+                            startDate = entity.get("value").asText();
+                        }
+                    }
+                    if (entity.get("field").asText().equals("endDate")) {
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.get("id").asText())) {
+                            endDate = updateEntity.getEntityUpdates().get(entity.get("id").asText());
+                        } else {
+                            endDate = entity.get("value").asText();
+                        }
+                    }
+                    if (entity.get("field").asText().equals("startBalance")) {
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.get("id").asText())) {
+                            startBalance = updateEntity.getEntityUpdates().get(entity.get("id").asText());
+                        } else {
+                            startBalance = entity.get("value").asText();
+                        }
+                    }
+                    if (entity.get("field").asText().equals("endBalance")) {
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.get("id").asText())) {
+                            endBalance = updateEntity.getEntityUpdates().get(entity.get("id").asText());
+                        } else {
+                            endBalance = entity.get("value").asText();
+                        }
+                    }
+                    if (entity.get("field").asText().equals("totalTransactions")) {
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.get("id").asText())) {
+                            totalTransaction = updateEntity.getEntityUpdates().get(entity.get("id").asText());
+                        } else {
+                            totalTransaction = entity.get("value").asText();
+                        }
+                    }
+                }
+                subInfoCell.setCellValue("Statement Period: from " + startDate + " to " + endDate);
+
+                Row subInfoRow2 = sheet.createRow(5);
+                Cell subInfoCell2 = subInfoRow2.createCell(0);
+                CellStyle subInfoStyle2 = getRowStyle2(workbook);
+                subInfoCell2.setCellStyle(subInfoStyle2);
+
+                Row subInfoRow3 = sheet.createRow(6);
+                Cell subInfoCell3 = subInfoRow3.createCell(0);
+                subInfoCell3.setCellStyle(subInfoStyle2);
+
+                Cell subInfoCell4 = subInfoRow2.createCell(3);
+                subInfoCell4.setCellStyle(subInfoStyle2);
+
+                Cell subInfoCell5 = subInfoRow3.createCell(3);
+                subInfoCell5.setCellStyle(subInfoStyle2);
+
+                Row subInfoRow4 = sheet.createRow(7);
+                Cell subInfoCell6 = subInfoRow4.createCell(3);
+                subInfoCell6.setCellStyle(subInfoStyle2);
+
+                String accountNumber = "";
+                String accountName = "";
+                String bankName = "";
+                String accountAddress = "";
+                String accountCurrency = "";
+                for (JsonNode entity : response.get("customerInfo")) {
+                    if (entity.get("field").asText().equals("account_id")) {
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.get("id").asText())) {
+                            accountNumber = updateEntity.getEntityUpdates().get(entity.get("id").asText());
+                        } else {
+                            accountNumber = entity.get("value").asText();
+                        }
+                    }
+                    if (entity.get("field").asText().equals("name")) {
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.get("id").asText())) {
+                            accountName = updateEntity.getEntityUpdates().get(entity.get("id").asText());
+                        } else {
+                            accountName = entity.get("value").asText();
+                        }
+                    }
+                    if (entity.get("field").asText().equals("bank")) {
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.get("id").asText())) {
+                            bankName = updateEntity.getEntityUpdates().get(entity.get("id").asText());
+                        } else {
+                            bankName = entity.get("value").asText();
+                        }
+                    }
+                    if (entity.get("field").asText().equals("address")) {
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.get("id").asText())) {
+                            accountAddress = updateEntity.getEntityUpdates().get(entity.get("id").asText());
+                        } else {
+                            accountAddress = entity.get("value").asText();
+                        }
+                    }
+                    if (entity.get("field").asText().equals("currency")) {
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.get("id").asText())) {
+                            accountCurrency = updateEntity.getEntityUpdates().get(entity.get("id").asText());
+                        } else {
+                            accountCurrency = entity.get("value").asText();
+                        }
+                    }
+                }
+                subInfoCell2.setCellValue("Account number: " + accountNumber);
+                subInfoCell3.setCellValue("Account name: " + accountName);
+                subInfoCell4.setCellValue("Bank name: " + bankName);
+                subInfoCell5.setCellValue("Account address: " + accountAddress);
+                subInfoCell6.setCellValue("Account currency: " + accountCurrency);
+
+                Row subInfoRow5 = sheet.createRow(10);
+                Cell subInfoCell7 = subInfoRow5.createCell(0);
+                CellStyle subInfoStyle7 = getSubHeaderStyle2(workbook);
+                subInfoCell7.setCellStyle(subInfoStyle7);
+
+                subInfoCell7.setCellValue("Activity Summary");
+
+                Row subInfoRow6 = sheet.createRow(11);
+                Cell subInfoCell8 = subInfoRow6.createCell(0);
+                Cell subInfoCell8_1 = subInfoRow6.createCell(1);
+                subInfoCell8.setCellStyle(subInfoStyle2);
+                subInfoCell8_1.setCellStyle(subInfoStyle2);
+
+                subInfoCell8.setCellValue("Opening Balance: ");
+                subInfoCell8_1.setCellValue(Double.parseDouble(startBalance));
+
+                Row subInfoRow7 = sheet.createRow(12);
+                Cell subInfoCell9 = subInfoRow7.createCell(0);
+                Cell subInfoCell9_1 = subInfoRow7.createCell(1);
+                subInfoCell9.setCellStyle(subInfoStyle2);
+                subInfoCell9_1.setCellStyle(subInfoStyle2);
+
+                subInfoCell9.setCellValue("Total transactions: ");
+                subInfoCell9_1.setCellValue(totalTransaction);
+
+                Row subInfoRow8 = sheet.createRow(13);
+                Cell subInfoCell10 = subInfoRow8.createCell(0);
+                Cell subInfoCell10_1 = subInfoRow8.createCell(1);
+                subInfoCell10.setCellStyle(subInfoStyle2);
+                subInfoCell10_1.setCellStyle(subInfoStyle2);
+
+                subInfoCell10.setCellValue("Closing Balance: ");
+                subInfoCell10_1.setCellValue(Double.parseDouble(endBalance));
+
+                Row subInfoRow9 = sheet.createRow(15);
+                Cell subInfoCell11 = subInfoRow9.createCell(0);
+                subInfoCell11.setCellStyle(subInfoStyle7);
+
+                subInfoCell11.setCellValue("Transaction History");
+
+                Row subInfoRow10 = sheet.createRow(17);
+                Cell subInfoCell12 = subInfoRow10.createCell(0);
+                CellStyle subInfoStyle12 = getTableStyle(workbook);
+                subInfoCell12.setCellStyle(subInfoStyle12);
+
+                subInfoCell12.setCellValue("Date");
+
+                Cell subInfoCell13 = subInfoRow10.createCell(1);
+                subInfoCell13.setCellStyle(subInfoStyle12);
+
+                subInfoCell13.setCellValue("Debit");
+
+                Cell subInfoCell14 = subInfoRow10.createCell(2);
+                subInfoCell14.setCellStyle(subInfoStyle12);
+
+                subInfoCell14.setCellValue("Credit");
+
+                Cell subInfoCell15 = subInfoRow10.createCell(3);
+                subInfoCell15.setCellStyle(subInfoStyle12);
+
+                subInfoCell15.setCellValue("Balance");
+
+                Cell subInfoCell16 = subInfoRow10.createCell(4);
+                subInfoCell16.setCellStyle(subInfoStyle12);
+
+                subInfoCell16.setCellValue("Transaction type");
+
+                Cell subInfoCell17 = subInfoRow10.createCell(5);
+                subInfoCell17.setCellStyle(subInfoStyle12);
+
+                subInfoCell17.setCellValue("Check no");
+
+                Cell subInfoCell18 = subInfoRow10.createCell(6);
+                subInfoCell18.setCellStyle(subInfoStyle12);
+
+                subInfoCell18.setCellValue("Description");
+
+                int rowIndex = 18;
+                CellStyle rowStyle = getTableStyle2(workbook);
+                for (JsonNode entity : response.get("data").get("accountXns")) {
+                    Row row = sheet.createRow(rowIndex++);
+                    Cell cell = row.createCell(0);
+                    Cell cell1 = row.createCell(1);
+                    Cell cell2 = row.createCell(2);
+                    Cell cell3 = row.createCell(3);
+                    Cell cell4 = row.createCell(4);
+                    Cell cell5 = row.createCell(5);
+                    Cell cell6 = row.createCell(6);
+
+                    cell.setCellValue(entity.get("date").asText().equals("null") ? "" : entity.get("date").asText());
+                    double debit = entity.get("debit").asText().equals("null") ? 0.0 : entity.get("debit").asDouble();
+                    if(debit == 0.0) {
+                        cell1.setCellValue("");
+                    } else {
+                        cell1.setCellValue(debit);
+                    }
+                    double credit = entity.get("credit").asText().equals("null") ? 0.0 : entity.get("credit").asDouble();
+                    if(credit == 0.0) {
+                        cell2.setCellValue("");
+                    } else {
+                        cell2.setCellValue(credit);
+                    }
+                    double balance = entity.get("balance").asText().equals("null") ? 0.0 : entity.get("balance").asDouble();
+                    if(balance == 0.0) {
+                        cell3.setCellValue("");
+                    } else {
+                        cell3.setCellValue(balance);
+                    }
+                    cell4.setCellValue(entity.get("txn_code").asText().equals("null") ? "" : entity.get("txn_code").asText());
+                    cell5.setCellValue(entity.get("chq_no").asText().equals("null") ? "" : entity.get("chq_no").asText());
+                    cell6.setCellValue(limitCellContent(entity.get("narration").asText().equals("null") ? "" : entity.get("narration").asText(), 62767));
+
+                    cell.setCellStyle(rowStyle);
+                    cell1.setCellStyle(rowStyle);
+                    cell2.setCellStyle(rowStyle);
+                    cell3.setCellStyle(rowStyle);
+                    cell4.setCellStyle(rowStyle);
+                    cell5.setCellStyle(rowStyle);
+                    cell6.setCellStyle(rowStyle);
+                }
+
+            } else {
+                Row subInfoRow = sheet.createRow(4);
+                Cell subInfoCell = subInfoRow.createCell(0);
+                CellStyle subInfoStyle = getSubHeaderStyle(workbook);
+                subInfoCell.setCellStyle(subInfoStyle);
+
+                int rowIndex = 5;
+                CellStyle rowStyle = getRowStyle(workbook);
+
+                if (updateEntity.getDocumentType().equals(DocumentType.OFFICIAL_RECEIPT)) {
+                    headerCell.setCellValue("Official Receipt Extracted Data");
+                    subInfoCell.setCellValue("Supplier information");
+
+                    List<Entity> entities = mapper.readValue(rawResult, new TypeReference<>() {
+                    });
+                    for (Entity entity : entities) {
+                        Row row = sheet.createRow(rowIndex++);
+                        Cell cell = row.createCell(0);
+                        Cell cell1 = row.createCell(1);
+                        cell.setCellValue(entity.getField() + " : ");
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.getId())) {
+                            cell1.setCellValue(updateEntity.getEntityUpdates().get(entity.getId()));
+                        } else {
+                            cell1.setCellValue(entity.getValue());
+                        }
+                        cell.setCellStyle(rowStyle);
+                        cell1.setCellStyle(rowStyle);
+                    }
+                }
+
+                if (updateEntity.getDocumentType().equals(DocumentType.DTI_CERTIFICATE)) {
+                    headerCell.setCellValue("DTI Certificate Extracted Data");
+                    subInfoCell.setCellValue("Certificate information");
+                }
+                if (updateEntity.getDocumentType().equals(DocumentType.REGISTRATION_CERTIFICATE)) {
+                    headerCell.setCellValue("Certificate of Registration Extracted Data");
+                    subInfoCell.setCellValue("Certificate information");
+                }
+                if (updateEntity.getDocumentType().equals(DocumentType.PAYSLIP)) {
+                    headerCell.setCellValue("Payslip Extracted Data");
+                    subInfoCell.setCellValue("Payslip information");
+                }
+
+                if (documentTypeList.contains(updateEntity.getDocumentType())) {
+                    JsonNode response = mapper.readTree(rawResult);
+                    for (JsonNode entity : response) {
+                        Row row = sheet.createRow(rowIndex++);
+                        Cell cell = row.createCell(0);
+                        Cell cell1 = row.createCell(1);
+                        cell.setCellValue(entity.get("field").asText() + " : ");
+                        if (updateEntity.getEntityUpdates() != null && updateEntity.getEntityUpdates().containsKey(entity.get("id").asText())) {
+                            cell1.setCellValue(updateEntity.getEntityUpdates().get(entity.get("id").asText()));
+                        } else {
+                            cell1.setCellValue(entity.get("value").asText());
+                        }
+                        cell.setCellStyle(rowStyle);
+                        cell1.setCellStyle(rowStyle);
+                    }
+                }
+            }
+
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            workbook.write(outputStream);
+            workbook.close();
+
+            // Upload the xlsx to S3
+            String[] path = submissionResult.getResultPath().split("\\.");
+            String pathXlsx = KEY_TO_XLSX.apply(path[0]);
+
+            s3Service.uploadExcel(outputStream.toByteArray(), pathXlsx);
+        } catch (IOException e) {
+            log.error("Error in documentExtractionToTemplate: {}", e.getMessage());
+            return false;
+        }
+        return true;
+    }
+
+    public String getMergedExtractionResultJson(String orgId, String userId, String submissionId, String identifier, DocumentType documentType, Map<String, String> updatedEntityMap) {
+        SubmissionResult submissionResult = submissionStore.getResult(orgId, userId, submissionId, identifier).await().indefinitely();
+        String rawResult = s3Service.getFile(submissionResult.getResultPath());
+
+        try {
+            ObjectMapper mapper = getObjectMapper();
+            JsonNode response = mapper.readTree(rawResult);
+            ArrayNode newArray = mapper.createArrayNode();
+            if (documentType.equals(DocumentType.BANK_STATEMENT)) {
+                ObjectNode data = mapper.createObjectNode();
+                ObjectNode bsDatas = mapper.createObjectNode();
+                bsDatas.put("accountAnalysis", response.get("data").get("accountAnalysis"));
+                bsDatas.put("accountXns", response.get("data").get("accountXns"));
+                for (JsonNode entity : response.get("data").get("customerInfo")) {
+                    ObjectNode modifiedObject = mapper.createObjectNode();
+                    modifiedObject.put("field", entity.get("field").asText());
+                    if (updatedEntityMap.containsKey(entity.get("id").asText())) {
+                        modifiedObject.put("value", updatedEntityMap.get(entity.get("id").asText()));
+                    } else {
+                        modifiedObject.put("value", entity.get("value").asText());
+                    }
+                    newArray.add(modifiedObject);
+                }
+                bsDatas.put("customerInfo", newArray);
+
+                ArrayNode newArray2 = mapper.createArrayNode();
+                for (JsonNode entity : response.get("customerInfo")) {
+                    ObjectNode modifiedObject = mapper.createObjectNode();
+                    modifiedObject.put("field", entity.get("field").asText());
+                    if (updatedEntityMap.containsKey(entity.get("id").asText())) {
+                        modifiedObject.put("value", updatedEntityMap.get(entity.get("id").asText()));
+                    } else {
+                        modifiedObject.put("value", entity.get("value").asText());
+                    }
+                    newArray2.add(modifiedObject);
+                }
+
+                data.put("customerInfo", newArray2);
+                data.put("data", bsDatas);
+                return mapper.writeValueAsString(data);
+            } else {
+                for (JsonNode entity : response) {
+                    ObjectNode modifiedObject = mapper.createObjectNode();
+                    modifiedObject.put("field", entity.get("field").asText());
+
+                    if (entity.has("reviewRequired")) {
+                        modifiedObject.put("reviewRequired", entity.get("reviewRequired").asText());
+                    }
+
+                    if (updatedEntityMap.containsKey(entity.get("id").asText())) {
+                        modifiedObject.put("value", updatedEntityMap.get(entity.get("id").asText()));
+                    } else {
+                        modifiedObject.put("value", entity.get("value").asText());
+                    }
+                    newArray.add(modifiedObject);
+                }
+                return mapper.writeValueAsString(newArray);
+            }
+        } catch (IOException e) {
+            log.error("Error in getMergedExtractionResultJson: {}", e.getMessage());
+        }
+        return rawResult;
+    }
+
+    private CellStyle getHeaderStyle(Workbook workbook) {
+        CellStyle style = workbook.createCellStyle();
+        Font font = workbook.createFont();
+        font.setBold(true);
+        font.setFontName("Arial");
+        font.setFontHeightInPoints((short) 16);
+        font.setColor(IndexedColors.DARK_BLUE.getIndex());
+        style.setFont(font);
+        return style;
+    }
+
+    private CellStyle getSubHeaderStyle(Workbook workbook) {
+        CellStyle style = workbook.createCellStyle();
+        Font font = workbook.createFont();
+        font.setBold(true);
+        font.setFontName("Arial");
+        font.setFontHeightInPoints((short) 12);
+        font.setColor(IndexedColors.DARK_BLUE.getIndex());
+        style.setFont(font);
+        return style;
+    }
+
+    private CellStyle getSubHeaderStyle2(Workbook workbook) {
+        CellStyle style = workbook.createCellStyle();
+        Font font = workbook.createFont();
+        font.setBold(true);
+        font.setFontName("Arial");
+        font.setFontHeightInPoints((short) 13);
+        font.setColor(IndexedColors.DARK_BLUE.getIndex());
+        style.setFont(font);
+        return style;
+    }
+
+    private CellStyle getRowStyle(Workbook workbook) {
+        CellStyle style = workbook.createCellStyle();
+        Font font = workbook.createFont();
+        font.setBold(true);
+        font.setFontName("Arial");
+        font.setFontHeightInPoints((short) 10);
+        font.setColor(IndexedColors.DARK_BLUE.getIndex());
+        style.setFont(font);
+        return style;
+    }
+
+    private CellStyle getRowStyle2(Workbook workbook) {
+        CellStyle style = workbook.createCellStyle();
+        Font font = workbook.createFont();
+        font.setBold(true);
+        font.setFontName("Arial");
+        font.setFontHeightInPoints((short) 10);
+        font.setColor(IndexedColors.BLACK.getIndex());
+        style.setFont(font);
+        style.setDataFormat((short) 4);
+        style.setAlignment(HorizontalAlignment.LEFT);
+        return style;
+    }
+
+    private static CellStyle getTableStyle(Workbook workbook) {
+        CellStyle style = workbook.createCellStyle();
+        Font font = workbook.createFont();
+        font.setBold(true);
+        font.setFontName("Arial");
+        font.setFontHeightInPoints((short) 10);
+        font.setColor(IndexedColors.DARK_BLUE.getIndex());
+        style.setFont(font);
+        style.setBorderTop(BorderStyle.THIN);
+        style.setBorderBottom(BorderStyle.THIN);
+        style.setBorderLeft(BorderStyle.THIN);
+        style.setBorderRight(BorderStyle.THIN);
+        return style;
+    }
+
+    private CellStyle getTableStyle2(Workbook workbook) {
+        CellStyle style = workbook.createCellStyle();
+        Font font = workbook.createFont();
+        font.setBold(true);
+        font.setFontName("Arial");
+        font.setFontHeightInPoints((short) 10);
+        font.setColor(IndexedColors.BLACK.getIndex());
+        style.setFont(font);
+        style.setDataFormat((short) 4);
+        style.setBorderTop(BorderStyle.THIN);
+        style.setBorderBottom(BorderStyle.THIN);
+        style.setBorderLeft(BorderStyle.THIN);
+        style.setBorderRight(BorderStyle.THIN);
+        return style;
+    }
+
+    private String limitCellContent(String content, int maxLength) {
+        if (content.length() > maxLength) {
+            return content.substring(0, maxLength);
+        }
+        return content;
+    }
+
+    private static CellStyle headerStyle(Workbook workbook) {
+        CellStyle headerStyle = workbook.createCellStyle();
+        Font font = workbook.createFont();
+        font.setFontName("Arial");
+        font.setBold(true);
+        font.setFontHeightInPoints((short) 10);
+        font.setColor(IndexedColors.WHITE.getIndex());
+        headerStyle.setFont(font);
+        headerStyle.setBorderTop(BorderStyle.THIN);
+        headerStyle.setBorderBottom(BorderStyle.THIN);
+        headerStyle.setBorderLeft(BorderStyle.THIN);
+        headerStyle.setBorderRight(BorderStyle.THIN);
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        headerStyle.setFillForegroundColor(IndexedColors.DARK_BLUE.getIndex());
+        return headerStyle;
+    }
+    private static CellStyle boldStyle(Workbook workbook) {
+        Font boldFont = workbook.createFont();
+        boldFont.setBold(true);
+        boldFont.setFontName("Arial");
+        CellStyle boldStyle = workbook.createCellStyle();
+        boldStyle.setFont(boldFont);
+        boldFont.setFontHeightInPoints((short) 10);
+        boldStyle.setBorderTop(BorderStyle.THIN);
+        boldStyle.setBorderBottom(BorderStyle.THIN);
+        boldStyle.setBorderLeft(BorderStyle.THIN);
+        boldStyle.setBorderRight(BorderStyle.THIN);
+        return boldStyle;
+    }
+    private static CellStyle style1(Workbook workbook) {
+        CellStyle style1 = workbook.createCellStyle();
+        Font font1 = workbook.createFont();
+        font1.setFontName("Arial");
+        font1.setFontHeightInPoints((short) 10);
+        font1.setColor(IndexedColors.BLACK.getIndex());
+        style1.setFont(font1);
+        style1.setAlignment(HorizontalAlignment.RIGHT);
+        style1.setBorderTop(BorderStyle.THIN);
+        style1.setBorderBottom(BorderStyle.THIN);
+        style1.setBorderLeft(BorderStyle.THIN);
+        style1.setBorderRight(BorderStyle.THIN);
+        return style1;
+    }
+    private static CellStyle style2(Workbook workbook) {
+        CellStyle style2 = workbook.createCellStyle();
+        style2.setAlignment(HorizontalAlignment.LEFT);
+        style2.setIndention((short) 3);
+        Font font2 = workbook.createFont();
+        font2.setFontName("Arial");
+        font2.setFontHeightInPoints((short) 10);
+        font2.setColor(IndexedColors.BLACK.getIndex());
+        style2.setFont(font2);
+        style2.setBorderTop(BorderStyle.THIN);
+        style2.setBorderBottom(BorderStyle.THIN);
+        style2.setBorderLeft(BorderStyle.THIN);
+        style2.setBorderRight(BorderStyle.THIN);
+        return style2;
+    }
+    private static CellStyle style3(Workbook workbook) {
+        CellStyle style3 = workbook.createCellStyle();
+        Font font3 = workbook.createFont();
+        style3.setAlignment(HorizontalAlignment.LEFT);
+        style3.setIndention((short) 2);
+        style3.setFont(font3);
+        font3.setFontName("Arial");
+        font3.setFontHeightInPoints((short) 10);
+        font3.setColor(IndexedColors.BLACK.getIndex());
+        style3.setBorderTop(BorderStyle.THIN);
+        style3.setBorderBottom(BorderStyle.THIN);
+        style3.setBorderLeft(BorderStyle.THIN);
+        style3.setBorderRight(BorderStyle.THIN);
+        return style3;
+    }
+
+    public static Integer rowIndex = 0;
+
+    private static int columnIndex = 0;
+
+    private static void extract(Workbook workbook, Sheet sheet, JsonNode node) {
+        List<String> yearKeys = new ArrayList<>();
+        List<String> otherKeys = new ArrayList<>();
+
+        // Separating year keys and other keys
+        node.fieldNames().forEachRemaining(key -> {
+            if (key.matches("\\d{4}")) {
+                yearKeys.add(key);
+            } else {
+                otherKeys.add(key);
+            }
+        });
+
+        Collections.sort(yearKeys); // Sort the year keys
+
+        for (String key : yearKeys) {
+            JsonNode value = node.get(key);
+            CellStyle headerStyle = headerStyle(workbook);
+
+            if (!key.equals("notes")) { // Skip processing the "notes" key
+                rowIndex = 5; // Reset the row index when encountering a new year
+                columnIndex++; // Increment the column index to print in the next pair of columns
+
+                Row row = sheet.getRow(rowIndex);
+                if (row == null) {
+                    row = sheet.createRow(rowIndex);
+                }
+
+                Cell cell1 = row.createCell(0);
+                String capitalizedKey = Character.toUpperCase(key.charAt(0)) + key.substring(1);
+
+                if (rowIndex == 5) {
+                    cell1.setCellValue("");
+                } else {
+                    cell1.setCellValue(capitalizedKey);
+                }
+                Cell cell2 = row.createCell(columnIndex + 1);
+
+                if (value.isObject()) {
+                    if (key.matches("\\d{4}")) { // Using regex to match years like "2020", "2021", etc.
+                        cell1.setCellStyle(headerStyle);
+                        cell2.setCellValue(key);
+                        cell2.setCellStyle(headerStyle);
+                    }
+                    // Set header style for year keys
+                    extract(workbook, sheet, value);
+                }
+            }
+        }
+        for (String key : otherKeys) {
+            JsonNode value = node.get(key);
+
+            CellStyle headerStyle = headerStyle(workbook);
+            CellStyle boldStyle = boldStyle(workbook);
+            CellStyle style1 = style1(workbook);
+            CellStyle style2 = style2(workbook);
+            CellStyle style3 = style3(workbook);
+
+            if (!key.equals("notes")) { // Skip processing the "notes" key
+                if (key.matches("\\d{4}")) { // Using regex to match years like "2020", "2021", etc.
+                    rowIndex = 5; // Reset the row index when encountering a new year
+                    columnIndex++; // Increment the column index to print in the next pair of columns
+                } else {
+                    rowIndex++; // Increment the row index to print in the next row
+                }
+
+                Row row = sheet.getRow(rowIndex);
+                if (row == null) {
+                    row = sheet.createRow(rowIndex);
+                }
+
+                Cell cell1 = row.createCell(0);
+                String capitalizedKey = Character.toUpperCase(key.charAt(0)) + key.substring(1);
+                cell1.setCellStyle(style2);
+                if (rowIndex == 5) {
+                    cell1.setCellValue("");
+                } else {
+                    cell1.setCellValue(capitalizedKey);
+                }
+                Cell cell2 = row.createCell(columnIndex + 1);
+                cell2.setCellStyle(style1);
+
+                if (value.isObject()) {
+                    if (key.matches("\\d{4}")) { // Using regex to match years like "2020", "2021", etc.
+                        cell1.setCellStyle(headerStyle);
+                        cell2.setCellValue(key);
+                        cell2.setCellStyle(headerStyle);
+                    }
+                    extract(workbook, sheet, value);
+                } else {
+                    cell2.setCellValue(value.asText());
+                }
+                // Apply bold formatting to specific Keys
+                if (key.equals("operating income") || key.equals("finance costs") || key.equals("income before tax") || key.equals("tax expense") || key.equals("net income")) {
+                    cell1.setCellStyle(boldStyle);
+                }
+                if (key.equals("assets") || key.equals("liabilities and equity") || key.equals("equity") || key.equals("total liabilities and equity") || key.equals("revenues") || key.equals("expenses") || key.equals("other comprehensive income") || key.equals("total comprehensive income") || key.equals("cash flows from operating activities") || key.equals("adjustments for:") || key.equals("cash flows from investing activities") || key.equals("cash flows from financing activities")) {
+                    cell1.setCellStyle(boldStyle);
+                }
+                if (key.equals("current assets") || key.equals("non-current assets") || key.equals("total assets") || key.equals("current liabilities") || key.equals("non-current liabilities") || key.equals("total liabilities")) {
+                    cell1.setCellStyle(style3);
+                }
+            }
+        }
+    }
+
+    public byte[] getSubmissionList(List<SubmissionEntity> submissions, Prefix filterType) {
+        Workbook workbook = new XSSFWorkbook();
+        Sheet sheet = workbook.createSheet("Submission List");
+
+        int columnWidth = 22; // Example: Set the width to 15 characters
+        sheet.setColumnWidth(0, columnWidth * 256);
+        sheet.setColumnWidth(1, columnWidth * 512);
+        ClassLoader classLoader = Thread.currentThread().getContextClassLoader();
+        InputStream imageStream = classLoader.getResourceAsStream("static/logo.png");
+        try{
+            // Add the image to the workbook
+            byte[] imageBytes = IOUtils.toByteArray(imageStream);
+            int pictureIdx = workbook.addPicture(imageBytes, Workbook.PICTURE_TYPE_PNG);
+            CreationHelper helper = workbook.getCreationHelper();
+            Drawing<?> drawing = sheet.createDrawingPatriarch();
+            ClientAnchor anchor = helper.createClientAnchor();
+            anchor.setCol2(1);
+            anchor.setRow2(1);
+            Picture picture = drawing.createPicture(anchor, pictureIdx);
+            picture.resize(1.2, 2.0);
+
+            Row headerRow = sheet.createRow(4);
+            Cell headerCell = headerRow.createCell(0);
+            CellStyle style = getHeaderStyle(workbook);
+            headerCell.setCellStyle(style);
+            headerCell.setCellValue("Submission " + filterType + " List");
+
+            CellStyle tableHeaderStyle = getTableStyle(workbook);
+            CellStyle rowStyle = style2(workbook);
+
+            rowIndex = 6;
+            Row row = sheet.createRow(rowIndex);
+            Cell cell = row.createCell(0);
+            cell.setCellStyle(tableHeaderStyle);
+            Cell cell1 = row.createCell(1);
+            cell1.setCellStyle(tableHeaderStyle);
+            Cell cell2 = row.createCell(2);
+            cell2.setCellStyle(tableHeaderStyle);
+            Cell cell3 = row.createCell(3);
+            cell3.setCellStyle(tableHeaderStyle);
+            Cell cell4 = row.createCell(4);
+            cell4.setCellStyle(tableHeaderStyle);
+            Cell cell5 = row.createCell(5);
+            cell5.setCellStyle(tableHeaderStyle);
+            Cell cell6 = row.createCell(6);
+            cell6.setCellStyle(tableHeaderStyle);
+            Cell cell7 = row.createCell(7);
+            cell7.setCellStyle(tableHeaderStyle);
+            Cell cell8 = row.createCell(8);
+            cell8.setCellStyle(tableHeaderStyle);
+            Cell cell9 = row.createCell(9);
+            cell9.setCellStyle(tableHeaderStyle);
+            Cell cell10 = row.createCell(10);
+            cell10.setCellStyle(tableHeaderStyle);
+            Cell cell11 = row.createCell(11);
+            cell11.setCellStyle(tableHeaderStyle);
+            Cell cell12 = row.createCell(12);
+            cell12.setCellStyle(tableHeaderStyle);
+            Cell cell13 = row.createCell(13);
+            cell13.setCellStyle(tableHeaderStyle);
+            cell.setCellValue("SK");
+            cell1.setCellValue("Submission ID");
+            cell2.setCellValue("Organization");
+            cell3.setCellValue("Customer type");
+            cell4.setCellValue("Customer name");
+            cell5.setCellValue("Status");
+            cell6.setCellValue("Total documents");
+            cell7.setCellValue("Total pages");
+            cell8.setCellValue("Duration in seconds");
+            cell9.setCellValue("File name");
+            cell10.setCellValue("Completed date");
+            cell11.setCellValue("Updated at");
+            cell12.setCellValue("Created by");
+            cell13.setCellValue("Created at");
+                rowIndex++;
+                for(SubmissionEntity entity : submissions){
+                    row = sheet.createRow(rowIndex);
+                    cell = row.createCell(0);
+                    cell.setCellValue(entity.getSk());
+                    cell.setCellStyle(rowStyle);
+                    cell1 = row.createCell(1);
+                    cell1.setCellValue(entity.getSubmissionId());
+                    cell1.setCellStyle(rowStyle);
+                    cell2 = row.createCell(2);
+                    cell2.setCellValue(entity.getOrgId());
+                    cell2.setCellStyle(rowStyle);
+                    cell3 = row.createCell(3);
+                    cell3.setCellValue(entity.getCustomerType());
+                    cell3.setCellStyle(rowStyle);
+                    cell4 = row.createCell(4);
+                    cell4.setCellValue(entity.getCustomerName());
+                    cell4.setCellStyle(rowStyle);
+                    cell5 = row.createCell(5);
+                    cell5.setCellValue(entity.getStatus());
+                    cell5.setCellStyle(rowStyle);
+                    cell6 = row.createCell(6);
+                    cell6.setCellValue(entity.getTotalDocuments() == null ? 0 : entity.getTotalDocuments());
+                    cell6.setCellStyle(rowStyle);
+                    cell7 = row.createCell(7);
+                    cell7.setCellValue(entity.getTotalPages() == null ? 0 : entity.getTotalPages());
+                    cell7.setCellStyle(rowStyle);
+                    cell8 = row.createCell(8);
+                    cell8.setCellValue(entity.getDurationInSeconds() == null ? "" : entity.getDurationInSeconds());
+                    cell8.setCellStyle(rowStyle);
+                    cell9 = row.createCell(9);
+                    cell9.setCellValue(entity.getFileName() == null ? "" : entity.getFileName());
+                    cell9.setCellStyle(rowStyle);
+                    cell10 = row.createCell(10);
+                    cell10.setCellValue(entity.getCompletedDate() == null ? "" : entity.getCompletedDate().toString());
+                    cell10.setCellStyle(rowStyle);
+                    cell11 = row.createCell(11);
+                    cell11.setCellValue(entity.getUpdatedAt() == null ? "" : entity.getUpdatedAt().toString());
+                    cell11.setCellStyle(rowStyle);
+                    cell12 = row.createCell(12);
+                    cell12.setCellValue(entity.getCreatedBy());
+                    cell12.setCellStyle(rowStyle);
+                    cell13 = row.createCell(13);
+                    cell13.setCellValue(entity.getCreatedAt().toString());
+                    cell13.setCellStyle(rowStyle);
+                    rowIndex++;
+                }
+
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            workbook.write(outputStream);
+            workbook.close();
+
+            return outputStream.toByteArray();
+        }
+        catch (IOException e){
+            log.error("Error in getSubmissionList: {}", e.getMessage());
+            throw new RuntimeException("Error in getSubmissionList: " + e.getMessage());
+        }
+    }
+
+
+

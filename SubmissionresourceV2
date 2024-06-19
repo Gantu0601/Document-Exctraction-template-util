@@ -1,0 +1,201 @@
+
+
+@Slf4j
+@Path("/v2/submission")
+public class SubmissionResourceV2 extends AbstractResource implements SubmissionV2Api {
+
+    @Inject
+    MySqlSubmissionStore mysqlSubmissionStore;
+
+    @Inject
+    DynamoSubmissionStore store;
+
+    @Inject
+    CheckDocumentTypes checkDocumentTypes;
+
+    @Inject
+    CheckSubmission checkSubmission;
+
+    @Inject
+    S3Service s3Service;
+
+    @Override
+    @Secured({UserRole.ORG_ADMIN, UserRole.ORG_USER})
+    public Uni<Response> submissionGetReportNew(String submissionId, DocumentType documentType) {
+        log.info("Get submission results report by id {} for Document {}", submissionId, documentType);
+        User user = getAuthUser().orElseThrow(ForbiddenException::new);
+
+        String prefix = String.join("/", user.getOrgId(), submissionId, documentType.name());
+        String ext = "xlsx";
+
+        if (user.getOrgId().equals(Prefix.RCBC.name())) {
+            ext = "csv";
+        }
+
+        String fileName = String.join(".", "transformed", ext);
+        String path = String.join("/", prefix, fileName);
+
+        return StreamResponse(s3Service.getFileAsBytesAsync(path), fileName);
+    }
+
+    @Override
+    @Secured({UserRole.ORG_ADMIN, UserRole.ORG_USER, UserRole.ADMIN})
+    public Uni<SubmissionListResponse> submissionListFromRDS(String pageNumber, String searchValue, SubmissionStatus status, LocalDate startDate, LocalDate endDate, LocalDate completedStartDate, LocalDate completedEndDate) {
+        log.info("List submissions");
+        User user = getAuthUser().orElseThrow(ForbiddenException::new);
+
+        boolean filterOwnSubmissions = !assertAllowed(user, UserRole.ORG_ADMIN);
+        String orgId = user.getOrgId();
+
+        if(user.getRoles().contains(UserRole.ADMIN)) {
+            filterOwnSubmissions = false;
+            orgId = null;
+        }
+
+        Uni<List<SubmissionEntity>> entitiesPromise = mysqlSubmissionStore.getSubmissionListByPagination(Integer.parseInt(pageNumber), 10, searchValue, orgId, filterOwnSubmissions ? user.getUserId() : null, status != null ? status.name() : null, startDate, endDate, completedStartDate, completedEndDate);
+        Uni<Long> countPromise = mysqlSubmissionStore.getCountAllSubmission(orgId, filterOwnSubmissions ? user.getUserId() : null, searchValue, status != null ? status.name() : null, startDate, endDate, completedStartDate, completedEndDate);
+
+        return entitiesPromise.map(SubmissionEntity::toSubmissionProfile)
+                .chain(submissions -> countPromise.map(count -> {
+                    int totalPages = (int) Math.ceil((double) count / 10);
+                    Map<String, Integer> pageInfo = Map.of(
+                            "totalPages", totalPages,
+                            "currentPage", Integer.parseInt(pageNumber)
+                    );
+
+                    return SubmissionListResponse.builder()
+                         .submissionList(submissions)
+                         .pageInfo(pageInfo)
+                         .build();
+                }));
+    }
+
+    @Override
+    @Secured({UserRole.ORG_ADMIN, UserRole.ORG_USER})
+    @Blocking
+    public Uni<GeneralResponse> submissionFileUploadV2(SubmissionFileUploadV2MultipartForm formData, String submissionId) {
+        log.info("FileUpload: {}, {}, {}", submissionId, formData.documentType, formData.name);
+        User user = getAuthUser().orElseThrow(ForbiddenException::new);
+
+        boolean checkProfile = checkSubmission.checkSubmissionProfile(user.getOrgId(), submissionId);
+        log.info("Check profile: {}", checkProfile);
+        if (!checkProfile) {
+            throw new BadRequestException("Submission profile is missing!");
+        }
+
+        if (null == formData.documentType) {
+            throw new BadRequestException("Invalid document type!");
+        }
+
+        if (null == formData._file) {
+            throw new BadRequestException("Missing file!");
+        }
+
+        boolean docTypeChecker = checkDocumentTypes.checkDocumentTypes(user, DocumentType.valueOf(formData.documentType));
+        if (!docTypeChecker) {
+            throw new ForbiddenException("Sorry, you don't have access to " + formData.documentType);
+        }
+
+        String password = "";
+        if (formData.password != null && !formData.password.isBlank()) {
+            password = formData.password;
+        }
+
+        DocumentType documentType = Arrays.stream(DocumentType.values())
+                .filter(value -> value.name().equals(formData.documentType))
+                .findFirst()
+                .orElseThrow(() -> new BadRequestException("Invalid Document Type"));
+
+        Tika tika = new Tika();
+
+        //Get submission files count
+        Uni<List<SubmissionFile>> filesPromise = store.listFiles(
+                user.getOrgId(), null, submissionId, TYPE_TO_FILE_PREFIX.apply(documentType)).collect().asList();
+        int lastIndex = filesPromise.await().indefinitely().size();
+
+        long totalDocuments = 1;
+        long sumPages = 0;
+
+        int totalPages = 1;
+
+        File file = formData._file;
+        FileUploadItem fileUploadItem;
+        try {
+            String contentType = tika.detect(file);
+            MimeType mimeType = MimeTypes.getDefaultMimeTypes().forName(contentType);
+
+            String fileName = IdUtil.randomId() + mimeType.getExtension();
+            String key = String.join("/", user.getOrgId(), submissionId, documentType.name(), fileName);
+
+            if (mimeType.toString().equals("application/pdf")) {
+                try {
+                    PDDocument pdDocument = PDFService.getPdfFile(file, password);
+                    totalPages = pdDocument.getNumberOfPages();
+                    pdDocument.close();
+                } catch (InvalidPasswordException ex) {
+                    throw new BadRequestException("Invalid password.");
+                }
+            }
+
+            sumPages += totalPages;
+            fileUploadItem = FileUploadItem.builder()
+                    .key(key)
+                    .path(file.getPath())
+                    .index(lastIndex)
+                    .prefix(TYPE_TO_FILE_PREFIX.apply(documentType))
+                    .contentType(contentType)
+                    .fileName(formData.name)
+                    .totalPages((long) totalPages)
+                    .build();
+        } catch (IOException ex) {
+            log.error("Failed to detect contentType", ex);
+            throw new BadRequestException("Failed to detect contentType");
+        } catch (MimeTypeException ex) {
+            log.error("Invalid contentType", ex);
+            throw new BadRequestException("Invalid contentType");
+        }
+
+        s3Service.uploadSubmissionFile(fileUploadItem)
+                .await()
+                .indefinitely();
+        store.createFile(fileBuilder(user, submissionId, fileUploadItem).build())
+                .await()
+                .indefinitely();
+
+        //Update profile documents & pages count
+        CompositeKey profileKey = CompositeKey.builder()
+                .pk(String.join("#", user.getOrgId(), submissionId))
+                .sk(Prefix.PROFILE.name())
+                .build();
+
+        store.updateProfile(profileKey, UpdateProfile.builder()
+                .totalPages(sumPages)
+                .totalDocuments(totalDocuments)
+                .build())
+                .await()
+                .indefinitely();
+
+        //Create submission document or update
+        if (lastIndex == 0) {
+            store.createDocument(documentBuilder(user, submissionId, documentType)
+                    .build())
+                    .await()
+                    .indefinitely();
+            return Uni.createFrom()
+                    .item(GeneralResponse.builder().message("Success").build());
+        }
+
+        CompositeKey documentKey = CompositeKey.builder()
+                .pk(String.join("#", user.getOrgId(), submissionId))
+                .sk(DynamoUtil.TYPE_TO_DOCUMENT_SK.apply(documentType))
+                .build();
+
+        store.updateDocument(documentKey, UpdateDocument.builder().build())
+                .await()
+                .indefinitely();
+        return Uni.createFrom()
+                .item(GeneralResponse.builder().message("Success").build());
+    }
+}
+
+
